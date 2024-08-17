@@ -6,9 +6,10 @@ import simpleobsws
 
 parameters = simpleobsws.IdentificationParameters(ignoreNonFatalRequestChecks=False)
 parameters.eventSubscriptions = (1 << 3) | (1 << 16)
-ws = simpleobsws.WebSocketClient(url='ws://localhost:4455', password='test', identification_parameters=parameters)
+ws = simpleobsws.WebSocketClient(url='ws://127.0.0.1:4455', password='testing', identification_parameters=parameters)
 
 midi_out = rtmidi.MidiOut()
+print(midi_out.get_ports())
 for idx, port in enumerate(midi_out.get_ports()):
     if "X-Touch-Ext" in port:
         midi_out.open_port(idx)
@@ -16,6 +17,7 @@ for idx, port in enumerate(midi_out.get_ports()):
         break
 
 midi_in = rtmidi.MidiIn()
+print(midi_in.get_ports())
 for idx, port in enumerate(midi_in.get_ports()):
     if "X-Touch-Ext" in port:
         midi_in.open_port(idx)
