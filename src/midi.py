@@ -1,10 +1,13 @@
 import logging
 import asyncio
 import time
+import copy
 import math
 import simpleobsws
 import rtmidi
+from enum import Enum
 
+import obs
 import utils
 
 MIDI_SIGNATURE = 'X-Touch-Ext'
@@ -18,19 +21,26 @@ MIDI_SCREEN_COLORS = {
     7: "WHITE",
     8: "BLACK"
 }
+MIDI_LED_MODES = [
+    (1, 11),
+    (17, 27),
+    (65, 75),
+    (81, 91)
+]
 
-obs_inputs = {
-    0: {"name": "CANCEL", "id": "0"},
-    1: {"name": "RESET", "id": "1"}
-}
- 
+def my_map(x, in_min, in_max, out_min, out_max):
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
 class Device:
     def __init__(self):
+        self.obs = None
+
         self.input = rtmidi.MidiIn()
         self.output = rtmidi.MidiOut()
 
         self.lock = asyncio.Lock()
         self.strips = []
+        self.stripInputUuids = {}
 
     async def print_ports(self):
         def do_print(midi):
@@ -65,443 +75,425 @@ class Device:
             return ret == 2
         return await asyncio.to_thread(do_open, self)
 
-    async def create_strip(self):
+    def set_obs(self, obs):
+        self.obs = obs
+
+    async def create_strips(self, num):
         async with self.lock:
-            strip = await asyncio.to_thread(Strip, self, len(self.strips))
-            await asyncio.to_thread(strip.reset)
-            self.strips.append(strip)
+            self.strips = []
+            for i in range(num):
+                strip = await asyncio.to_thread(Strip, self, len(self.strips))
+                await asyncio.to_thread(strip.reset)
+                self.strips.append(strip)
 
     async def clear_strips(self):
         async with self.lock:
             self.strips = []
 
-async def filter_audio_inputs(my_reqs):
-    global obs_inputs
+    def _set_lcd_color(self, num: int, colorIdx: int):
+        payload = [0xF0, 0x00, 0x00, 0x66, 0x15, 0x72]
+        for strip in self.strips:
+            payload.append(strip.stateData.lcdColorIdx if strip.state == Strip.State.Active else 7)
+        payload.append(0xF7)
+        payload[num + 6] = colorIdx
 
-    ret = await obs.ws.call_batch(my_reqs, halt_on_failure=False)
+        self.output.send_message(payload)
 
-    for idx, result in enumerate(ret, 2):
-        if not result.ok():
-            obs_inputs.pop(idx)
-
-    obs_inputs = {new_key: value for new_key, (old_key, value) in enumerate(obs_inputs.items())}
-
-def my_map(x, in_min, in_max, out_min, out_max):
-    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
-
-class Strip:
-    led_modes = {
-        0: (1, 11),
-        1: (17, 27),
-        2: (65, 75),
-        3: (81, 91),
-    }
-
-    def __init__(self, midi: Device, num: int):
-        self.midi = midi
-        self.num = num
-        self.enc_mode = 3
-        self.enc_value = -81
-        self.rec = 0
-        self.solo = 0
-        self.mute = 0
-        self.select = 0
-        self.color_cnt = 7
-        self.color_idx = 7
-        self.option = 0
-        self.source_name = ""
-        self.source_uuid = ""
-        self.source_cnt = 0
-        self.source_idx = 0
-        self.fader_current = 0
-        self.fader_busy = 0
-        self.fader_delta = 0
-
-    def reset(self):
-        # reset internal variables
-        self.enc_mode = 3
-        self.enc_value = -81
-        self.rec = 0
-        self.solo = 0
-        self.mute = 0
-        self.select = 0
-        self.color_cnt = 7
-        self.color_idx = 7
-        self.option = 0
-        self.source_name = ""
-        self.source_uuid = ""
-        self.source_cnt = 0
-        self.source_idx = 0
-        self.fader_current = 0
-        self.fader_busy = 0
-        self.fader_delta = 0
-
-        # reset LCD color
-        self.change_lcd_color(self.color_idx)
-
-        # reset LCD text
-        self.write_text(0, "")
-        self.write_text(1, "")
-
-        # power off encoder leds
-        self.midi.output.send_message([176, self.num + 48, 0])
-
-        # power off buttons
-        self.midi.output.send_message([144, self.num, 0])
-        self.midi.output.send_message([144, self.num + 8, 0])
-        self.midi.output.send_message([144, self.num + 16, 0])
-
-        # reset fader
-        self.midi.output.send_message([self.num + 224, 1, 0])
-
-    def restore(self):
-        # restore internal variables (counters)
-        self.source_cnt = self.source_idx
-        self.color_cnt = self.color_idx
-        self.select = 0
-
-        # restore text
-        self.write_text(0, self.source_name)
-        self.write_text(1, "")
-
-        # restore LCD color
-        self.change_lcd_color(self.color_idx)
-
-        # restore buttons leds
-        self.midi.output.send_message([144, self.num, self.rec * 127])
-        self.midi.output.send_message([144, self.num + 8, self.solo * 127])
-        self.midi.output.send_message([144, self.num + 16, self.mute * 127])
-        self.midi.output.send_message([144, self.num + 24, self.select])
-
-        # restore encoder leds
-        final_value = self.enc_value + self.led_modes[self.enc_mode][0]
-        self.midi.output.send_message([176, self.num + 48, final_value])
-
-        # restore fader
-        self.midi.output.send_message([self.num + 224, 1, self.fader_current])
-
-    async def process_button(self, msg):
-        button = msg[0]
-        value = msg[1]
-
-        if button == self.num:  # REC button TRACK
-            if value == 127:
-                if self.select == 0:
-                    if self.source_name != "":
-                        self.rec = 1 - self.rec
-                        self.midi.output.send_message([144, self.num, self.rec * 127])
-                        await obs.call("SetInputAudioTracks", {"inputUuid": self.source_uuid, "inputAudioTracks": {"2": bool(self.rec)}})
-
-        elif button == self.num + 8:  # SOLO button
-            if value == 127:
-                if self.select == 0:
-                    if self.source_name != "":
-                        self.solo = 1 - self.solo
-                        if self.solo == 1:
-                            monitor_type = "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT"
-                        else:
-                            monitor_type = "OBS_MONITORING_TYPE_NONE"
-
-                        self.midi.output.send_message([144, self.num + 8, self.solo * 127])
-                        await obs.call("SetInputAudioMonitorType", {"inputUuid": self.source_uuid, "monitorType": monitor_type})
-
-        elif button == self.num + 16:  # MUTE button
-            if value == 127:
-                if self.select == 0:
-                    if self.source_name != "":
-                        self.mute = 1 - self.mute
-                        self.midi.output.send_message([144, self.num + 16, self.mute * 127])
-                        await obs.call("SetInputMute", {"inputUuid": self.source_uuid, "inputMuted": bool(self.mute)})
-
-        elif button == self.num + 24:  # SELECT button
-            if value == 127:
-                # todo: listen to OBS EVENTS and cancel selection if sources changed while selecting
-                # restore all the other strips
-                for strip in self.midi.strips:
-                    if strip.num != self.num:
-                        strip.restore()
-
-                # change select status
-                self.select = 1 - self.select
-                self.midi.output.send_message([144, self.num + 24, self.select])
-
-                if self.select == 1:
-                    # power off encoder leds
-                    self.midi.output.send_message([176, self.num + 48, 0])
-
-                    # power off buttons leds
-                    self.midi.output.send_message([144, self.num, 0])
-                    self.midi.output.send_message([144, self.num + 8, 0])
-                    self.midi.output.send_message([144, self.num + 16, 0])
-
-                    # get sources from obs
-                    req_list = []
-                    res = await obs.call("GetInputList")
-                    for idx, inpt in enumerate(res["inputs"], 2):
-                        obs_inputs[idx] = {"name": inpt["inputName"], "id": inpt["inputUuid"]}
-                        req_list.append(simpleobsws.Request('GetInputAudioMonitorType', {"inputUuid": inpt["inputUuid"]}, ))
-                    await filter_audio_inputs(req_list)
-
-                    # update LCD text
-                    if self.option == 0:
-                        self.write_text(0, "SOURCE")
-                        self.write_text(1, obs_inputs[self.source_idx]["name"])
-                    else:
-                        self.write_text(0, "COLOR")
-                        self.write_text(1, MIDI_SCREEN_COLORS[self.color_idx])
-
-                elif self.select == 0:
-                    if self.option == 0:
-
-                        # get current selection
-                        source_selected_name = obs_inputs[self.source_cnt]["name"]
-                        source_selected_idx = obs_inputs[self.source_cnt]["id"]
-
-                        if source_selected_name == "CANCEL":
-                            self.restore()
-
-                        elif source_selected_name == "RESET":
-                            self.reset()
-
-                        else:
-                            if self.source_uuid != source_selected_idx:
-                                for strip in self.midi.strips:
-                                    if strip.source_uuid == source_selected_idx:
-                                        self.color_cnt = strip.color_idx
-                                        self.color_idx = strip.color_idx
-                                        self.enc_mode = strip.enc_mode
-
-                            if self.source_uuid != source_selected_idx:
-                                # get OBS states to update button states
-                                current_solo = await obs.call("GetInputAudioMonitorType", {"inputUuid": source_selected_idx})
-                                current_solo = current_solo["monitorType"]
-                                current_mute = await obs.call("GetInputMute", {"inputUuid": source_selected_idx})
-                                current_mute = current_mute["inputMuted"]
-                                current_balance = await obs.call("GetInputAudioBalance", {"inputUuid": source_selected_idx})
-                                current_balance = current_balance["inputAudioBalance"] * 10
-                                current_slider = await obs.call("GetInputVolume", {"inputUuid": source_selected_idx})
-                                current_slider = utils.x32_db_to_fader_val(current_slider["inputVolumeDb"])
-                                current_track = await obs.call("GetInputAudioTracks", {"inputUuid": source_selected_idx})
-                                current_track = int(current_track["inputAudioTracks"]["2"])
-
-                                # update internal variables
-                                if current_solo == "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT":
-                                    self.solo = 1
-                                else:
-                                    self.solo = 0
-
-                                self.enc_value = current_balance
-                                self.rec = current_track
-                                self.mute = int(current_mute)
-                                self.fader_current = current_slider
-                                self.source_name = source_selected_name
-                                self.source_uuid = source_selected_idx
-                                self.source_idx = self.source_cnt
-
-                            # update LCD Text
-                            self.write_text(0, self.source_name)
-                            self.write_text(1, "")
-
-                            # update LCD color
-                            self.change_lcd_color(self.color_idx)
-                            self.color_cnt = self.color_idx
-
-                            # update buttons leds
-                            self.midi.output.send_message([144, self.num, self.rec * 127])
-                            self.midi.output.send_message([144, self.num + 8, self.solo * 127])
-                            self.midi.output.send_message([144, self.num + 16, self.mute * 127])
-
-                            # update encoder leds
-                            final_value = self.enc_value + self.led_modes[self.enc_mode][0]
-                            self.midi.output.send_message([176, self.num + 48, final_value])
-
-                            # update fader
-                            self.midi.output.send_message([self.num + 224, 1, self.fader_current])
-
-                            # reset strips that previously have the current selection
-                            for strip in self.midi.strips:
-                                if strip.source_uuid == source_selected_idx and strip.num != self.num:
-                                    strip.reset()
-
-                    elif self.option == 1:
-                        self.color_idx = self.color_cnt
-                        self.restore()
-
-        elif button == self.num + 32:  # ENCODER button
-            if value == 127:
-                if self.select == 0:
-                    if self.source_idx != 0:
-                        # update encoder mode
-                        self.enc_mode = self.enc_mode + 1
-                        if self.enc_mode > (len(self.led_modes) - 1):
-                            self.enc_mode = 0
-
-                        # update encoder lights
-                        final_value = self.enc_value + self.led_modes[self.enc_mode][0]
-                        self.midi.output.send_message([176, self.num + 48, final_value])
-
-                elif self.select == 1:
-                    self.option = 0 ** self.option
-
-                    if self.option == 0:
-                        self.write_text(0, "SOURCE")
-                        self.write_text(1, obs_inputs[self.source_cnt]["name"])
-                    else:
-                        self.write_text(0, "COLOR")
-                        self.write_text(1, MIDI_SCREEN_COLORS[self.color_cnt])
-
-        else:
-            logging.info('Unhandled event on strip: {}'.format(self.num))
-
-    async def process_encoder(self, msg):
-        if self.select == 0:
-            if self.source_idx != 0:
-
-                if msg[1] < 50:
-                    self.enc_value = self.enc_value + 1
-                    if self.enc_value > 10:
-                        self.enc_value = 10
-
-                elif msg[1] > 50:
-                    self.enc_value = self.enc_value - 1
-                    if self.enc_value < 0:
-                        self.enc_value = 0
-
-                await obs.call("SetInputAudioBalance", {"inputUuid": self.source_uuid, "inputAudioBalance": self.enc_value / 10})
-
-        if self.select == 1:
-            if msg[1] < 50:
-                if self.option == 0:
-                    self.source_cnt = self.source_cnt + 1
-                    if self.source_cnt > (len(obs_inputs) - 1):
-                        self.source_cnt = len(obs_inputs) - 1
-                    self.write_text(0, "SOURCE")
-                    self.write_text(1, obs_inputs[self.source_cnt]["name"])
-                elif self.option == 1:
-                    self.color_cnt = self.color_cnt + 1
-                    if self.color_cnt > 8:
-                        self.color_cnt = 1
-                    self.write_text(0, "COLOR")
-                    self.write_text(1, MIDI_SCREEN_COLORS[self.color_cnt])
-                    self.change_lcd_color(self.color_cnt)
-
-            elif msg[1] > 50:
-                if self.option == 0:
-                    self.source_cnt = self.source_cnt - 1
-                    if self.source_cnt < 0:
-                        self.source_cnt = 0
-                    self.write_text(0, "SOURCE")
-                    self.write_text(1, obs_inputs[self.source_cnt]["name"])
-                else:
-                    self.color_cnt = self.color_cnt - 1
-                    if self.color_cnt < 1:
-                        self.color_cnt = 8
-                    self.write_text(0, "COLOR")
-                    self.write_text(1, MIDI_SCREEN_COLORS[self.color_cnt])
-                    self.change_lcd_color(self.color_cnt)
-
-    async def process_fader(self, msg):
-        if self.source_name != "":
-            if self.select == 0:
-                self.fader_current = msg[1]
-                self.fader_delta = time.time_ns()
-                self.fader_busy = 1
-
-                db = utils.x32_fader_val_to_db(msg[1])
-                req = simpleobsws.Request("SetInputVolume", {"inputUuid": self.source_uuid, "inputVolumeDb": db})
-                await obs.ws.emit(req)
-
-    def pos_fader(self):
-        self.midi.output.send_message([self.num + 224, 1, self.fader_current])
-        self.fader_busy = 0
-
-    def write_text(self, line, my_str):
+    def _write_text(self, num: int, line: int, text):
         if not (0 <= line <= 1):
             print("wrong LCD line")
             return
 
-        my_str = my_str[:7]
-        if not my_str:
-            my_str = '       ' # In some cases, writing an empty string to the LCD will do nothing
+        text = text[:7]
+        if not text:
+            text = '       ' # In some cases, writing an empty string to the LCD will do nothing
 
         # Clear LCD text
-        self.midi.output.send_message([
+        self.output.send_message([
             0xF0,  # MIDI System Exclusive Start
             0x00, 0x00, 0x66,  # Header of Mackie Control Protocol
             0x15,  # Device vendor ID
             0x12,  # Command: Update LCD
-            0x00 + (7 * self.num) + (56 * line),  # Offset (starting position in LCD) 0x00 to 0x37 for the upper line and 0x38 to 0x6F for the lower line
+            0x00 + (7 * num) + (56 * line),  # Offset (starting position in LCD) 0x00 to 0x37 for the upper line and 0x38 to 0x6F for the lower line
             0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,  # Chars to display in UTF-16
             0xF7  # MIDI System Exclusive End
         ])
 
         # write LCD text
-        payload = [0xF0, 0x00, 0x00, 0x66, 0x15, 0x12, 0x00 + (7 * self.num) + (56 * line)]
-        text = [ord(char) for char in my_str]
-        payload.extend(text)
+        payload = [0xF0, 0x00, 0x00, 0x66, 0x15, 0x12, 0x00 + (7 * num) + (56 * line)]
+        payload.extend([ord(char) for char in text])
         payload.append(0xF7)
-        self.midi.output.send_message(payload)
+        self.output.send_message(payload)
 
-    def change_lcd_color(self, clr):
-        payload = [0xF0, 0x00, 0x00, 0x66, 0x15, 0x72]
+    def _set_led_encoder(self, num: int, val: int):
+        self.output.send_message([176, num + 48, val])
+    def _set_led_rec(self, num: int, on: bool):
+        self.output.send_message([144, num, 127 if on else 0])
+    def _set_led_solo(self, num: int, on: bool):
+        self.output.send_message([144, num + 8, 127 if on else 0])
+    def _set_led_mute(self, num: int, on: bool):
+        self.output.send_message([144, num + 16, 127 if on else 0])
+    def _set_led_select(self, num: int, on: bool):
+        self.output.send_message([144, num + 24, 127 if on else 0])
 
-        for strip in self.midi.strips:
-            payload.append(strip.color_idx)
+    def _set_fader_pos(self, num: int, pos: int):
+        self.output.send_message([num + 224, 1, pos])
 
-        payload.append(0xF7)
+    def _set_volmeter_db(self, num: int, db: float): # TODO: Use correct scale for this
+        midi_value = my_map(db, -60, 0, 0, 14)
+        self.output.send_message([208, (num * 16 + midi_value), 0])
 
-        payload[self.num + 6] = clr
+class Strip:
+    class State(Enum):
+        Idle = 0
+        Active = 1
+        Config = 2
 
-        self.midi.output.send_message(payload)
+    class StateDataIdle:
+        def __init__(self, midi: Device, num: int):
+            self.midi = midi
+            self.num = num
 
-    def update_volumeter(self, obs_event_data):
-        if self.select == 0:
-            average_mul = [channel[1] for channel in obs_event_data]
-            average_mul = sum(average_mul) / len(average_mul)
+            self.lcdColorIdx = 7
 
-            if average_mul > 0:
-                current_peak_db = 20 * math.log10(average_mul)
+        def render(self):
+            logging.info('Idle render')
+            if not self.midi:
+                return
+            self.midi._set_lcd_color(self.num, self.lcdColorIdx)
+            self.midi._write_text(self.num, 0, '')
+            self.midi._write_text(self.num, 1, '')
+            self.midi._set_led_encoder(self.num, 0)
+            self.midi._set_led_rec(self.num, False)
+            self.midi._set_led_solo(self.num, False)
+            self.midi._set_led_mute(self.num, False)
+            self.midi._set_led_select(self.num, False)
+            self.midi._set_fader_pos(self.num, 0)
 
-                if current_peak_db < -60:
-                    current_peak_db = -60
-                elif current_peak_db > -4:
-                    current_peak_db = 0
+    class StateDataActive:
+        def __init__(self, midi: Device, num: int):
+            self.midi = midi
+            self.num = num
 
-                midi_value = my_map(current_peak_db, -60, 0, 0, 14)
-                self.midi.output.send_message([208, (self.num * 16 + midi_value), 0])
+            self.input = None
 
-    def update_fader(self, obs_event_data):
-        if self.fader_busy:
+            self.lcdColorIdx = 7
+
+            self.faderTime = None
+
+        def render(self):
+            logging.info('Active render')
+            if not self.midi:
+                return
+            self._render_leds()
+            self._render_lcd()
+            self._render_fader()
+
+        def _render_leds(self):
+            self.midi._set_led_encoder(self.num, round(self.input.audioBalance * 10) + MIDI_LED_MODES[1][0])
+            self.midi._set_led_rec(self.num, self.input.audioTracks.get('2') or False)
+            self.midi._set_led_solo(self.num, self.input.audioMonitorType == 'OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT')
+            self.midi._set_led_mute(self.num, self.input.audioMuted)
+            self.midi._set_led_select(self.num, False)
+
+        def _render_lcd(self):
+            self.midi._set_lcd_color(self.num, self.lcdColorIdx)
+            self.midi._write_text(self.num, 0, self.input.name)
+            self.midi._write_text(self.num, 1, '')
+
+        def _render_fader(self):
+            if self.fader_busy() == 1:
+                return
+            pos = utils.x32_db_to_fader_val(self.input.audioVolumeDb)
+            self.midi._set_fader_pos(self.num, pos)
+
+        def set_input(self, input: obs.Input):
+            self.input = input
+
+        def fader_busy(self) -> int:
+            if not self.faderTime:
+                return 0
+            if time.time_ns() - self.faderTime > 800000000:
+                self.faderTime = None
+                return -1
+            return 1
+
+    class StateDataConfig:
+        def __init__(self, midi: Device, num: int):
+            self.midi = midi
+            self.num = num
+
+            self.menu = 0 # 0 == input, 1 == LCD color
+
+            # Input Menu
+            self.inputList = [
+                ['CANCEL', True],
+                ['RESET', None]
+            ]
+            for pair in midi.obs.inputNames:
+                if not pair[1].supportsAudio:
+                    continue
+                self.inputList.append(copy.copy(pair))
+            self.inputIdx = 0
+
+            # LCD Color Menu
+            self.lcdColorIdx = 7
+
+        def render(self):
+            logging.info('Config render')
+            if not self.midi:
+                return
+            self._render_leds()
+            self._render_lcd()
+
+        def _render_leds(self):
+            self.midi._set_led_encoder(self.num, 0)
+            self.midi._set_led_rec(self.num, False)
+            self.midi._set_led_solo(self.num, False)
+            self.midi._set_led_mute(self.num, False)
+            self.midi._set_led_select(self.num, True)
+
+        def _render_lcd(self):
+            if self.menu == 0:
+                self.midi._write_text(self.num, 0, "SOURCE")
+                self.midi._write_text(self.num, 1, self.inputList[self.inputIdx][0])
+            elif self.menu == 1:
+                self.midi._write_text(self.num, 0, "COLOR")
+                self.midi._write_text(self.num, 1, MIDI_SCREEN_COLORS[self.lcdColorIdx])
+            self.midi._set_lcd_color(self.num, self.lcdColorIdx)
+
+        def iterate_menu(self):
+            self.menu += 1
+            if self.menu == 2:
+                self.menu = 0
+            self._render_lcd()
+
+        def iterate_selection(self, offset):
+            if self.menu == 0:
+                self.inputIdx += offset
+                if self.inputIdx < 0:
+                    self.inputIdx = len(self.inputList) - 1
+                elif self.inputIdx >= len(self.inputList):
+                    self.inputIdx = 0
+            elif self.menu == 1:
+                self.lcdColorIdx += offset
+                if self.lcdColorIdx < 1:
+                    self.lcdColorIdx = len(MIDI_SCREEN_COLORS)
+                elif self.lcdColorIdx > len(MIDI_SCREEN_COLORS):
+                    self.lcdColorIdx = 1
+            self._render_lcd()
+
+    def __init__(self, midi: Device, num: int):
+        self.midi = midi
+        self.num = num
+        self.state = self.State.Idle
+        self.stateData = self.StateDataIdle(midi, num)
+        self.oldState = None
+        self.oldStateData = None
+        self.enc_mode = 3
+        self.enc_value = -81
+
+    def reset(self):
+        # reset internal variables
+        if self.state == self.State.Active:
+            if self.stateData.input.uuid in self.midi.stripInputUuids:
+                del self.midi.stripInputUuids[self.stateData.input.uuid]
+        self.state = self.State.Idle
+        self.stateData = self.StateDataIdle(self.midi, self.num)
+        self.oldState = None
+        self.oldStateData = None
+        self.enc_mode = 3
+        self.enc_value = -81
+
+        self.stateData.render()
+
+    def restore(self):
+        if not self.oldState:
             return
 
-        db = obs_event_data["inputVolumeDb"]
-        self.fader_current = utils.x32_db_to_fader_val(db)
+        if self.state == self.State.Active:
+            if self.stateData.input.uuid in self.midi.stripInputUuids:
+                del self.midi.stripInputUuids[self.stateData.input.uuid]
 
-        logging.info('Set fader to {}'.format(self.fader_current))
+        self.state = self.oldState
+        self.oldState = None
 
-        self.midi.output.send_message([self.num + 224, 1, self.fader_current])
+        self.stateData = self.oldStateData
+        self.oldStateData = None
 
-    def update_mute(self, obs_event_data):
-        if self.select == 0:
-            self.mute = int(obs_event_data["inputMuted"])
-            self.midi.output.send_message([144, self.num + 16, self.mute * 127])
+        self.stateData.midi = self.midi
+        self.stateData.render()
 
-    def update_track(self, obs_event_data):
-        if self.select == 0:
-            self.rec = int(obs_event_data["inputAudioTracks"]["2"])
-            self.midi.output.send_message([144, self.num, self.rec * 127])
+        if self.state == self.State.Active:
+            self.midi.stripInputUuids[self.stateData.input.uuid] = self
 
-    def update_balance(self, obs_event_data):
-        if self.select == 0:
-            val = int(round(obs_event_data["inputAudioBalance"], 1) * 10)
-            self.enc_value = val
-            final_value = self.enc_value + self.led_modes[self.enc_mode][0]
-            self.midi.output.send_message([176, self.num + 48, final_value])
+    async def process_button(self, msg):
+        button = msg[0]
+        value = msg[1]
 
-    def update_monitor(self, obs_event_data):
-        if self.select == 0:
-            if obs_event_data["monitorType"] == "OBS_MONITORING_TYPE_NONE":
-                self.solo = 0
+        if button == self.num + 32: # ENCODER button
+            if not value:
+                return
+            if self.state == self.State.Active:
+                # update encoder mode
+                self.enc_mode = self.enc_mode + 1
+                if self.enc_mode > (len(self.led_modes) - 1):
+                    self.enc_mode = 0
+
+                # update encoder lights
+                final_value = self.enc_value + self.led_modes[self.enc_mode][0]
+                self.midi.output.send_message([176, self.num + 48, final_value])
+
+            elif self.state == self.State.Config:
+                self.stateData.iterate_menu()
+
+        elif button == self.num: # REC button TRACK
+            if not value or self.state != self.State.Active: # Value will be 127 if pressed down, 0 if released
+                return
+            new = not (self.stateData.input.audioTracks.get('2') or False)
+            await self.midi.obs.call('SetInputAudioTracks', {'inputUuid': self.stateData.input.uuid, 'inputAudioTracks': {'2': new}})
+
+        elif button == self.num + 8: # SOLO button
+            if not value or self.state != self.State.Active:
+                return
+            new = 'OBS_MONITORING_TYPE_NONE'
+            if self.stateData.input.audioMonitorType == 'OBS_MONITORING_TYPE_NONE':
+                new = 'OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT'
             else:
-                self.solo = 1
-            self.midi.output.send_message([144, self.num + 8, self.solo * 127])
+                new = 'OBS_MONITORING_TYPE_NONE'
+            await self.midi.obs.call('SetInputAudioMonitorType', {'inputUuid': self.stateData.input.uuid, 'monitorType': new})
+
+        elif button == self.num + 16: # MUTE button
+            if not value or self.state != self.State.Active:
+                return
+            new = not self.stateData.input.audioMuted
+            await self.midi.obs.call('SetInputMute', {'inputUuid': self.stateData.input.uuid, 'inputMuted': new})
+
+        elif button == self.num + 24: # SELECT button
+            if not value:
+                return
+
+            # Only allow one strip to be in config mode
+            for strip in self.midi.strips:
+                if strip.num != self.num:
+                    strip.restore()
+
+            if self.state == self.State.Config:
+                newInput = self.stateData.inputList[self.stateData.inputIdx][1]
+                lcdColorIdx = self.stateData.lcdColorIdx
+                if newInput == True or (self.oldState == self.State.Active and self.oldStateData.input == newInput):
+                    self.restore()
+                    if self.state == self.State.Active:
+                        self.stateData.lcdColorIdx = lcdColorIdx
+                        self.stateData._render_lcd()
+                elif not newInput:
+                    self.reset()
+                else:
+                    for strip in self.midi.strips:
+                        if strip.state == self.State.Active and strip.stateData.input.uuid == newInput.uuid:
+                            strip.reset()
+                    self.oldState = None
+                    self.oldStateData = None
+                    self.state = self.State.Active
+                    self.stateData = self.StateDataActive(self.midi, self.num)
+                    self.stateData.set_input(newInput)
+                    self.stateData.lcdColorIdx = lcdColorIdx
+                    self.stateData.render()
+                    self.midi.stripInputUuids[newInput.uuid] = self
+            else:
+                if self.state == self.State.Active:
+                    if self.stateData.input.uuid in self.midi.stripInputUuids:
+                        del self.midi.stripInputUuids[self.stateData.input.uuid]
+                self.oldState = self.state
+                self.oldStateData = self.stateData
+                self.oldStateData.midi = None
+                self.state = self.State.Config
+                self.stateData = self.StateDataConfig(self.midi, self.num)
+                self.stateData.lcdColorIdx = self.oldStateData.lcdColorIdx
+                self.stateData.render()
+
+        else:
+            logging.info('Unhandled event on strip: {}'.format(self.num))
+
+    async def process_encoder(self, msg):
+        if self.state == self.State.Active:
+            logging.info('Encoder value: {}'.format(msg[1]))
+            if msg[1] < 50:
+                new = round(self.stateData.input.audioBalance + 0.1, 1)
+                if new > 1.0:
+                    new = 1.0
+                await self.midi.obs.call('SetInputAudioBalance', {'inputUuid': self.stateData.input.uuid, 'inputAudioBalance': new})
+            elif msg[1] > 50:
+                new = round(self.stateData.input.audioBalance - 0.1, 1)
+                if new < 0.0:
+                    new = 0.0
+                await self.midi.obs.call('SetInputAudioBalance', {'inputUuid': self.stateData.input.uuid, 'inputAudioBalance': new})
+            logging.info('New: {}'.format(new))
+
+        elif self.state == self.State.Config:
+            if msg[1] < 50: # Turn clockwise
+                self.stateData.iterate_selection(1)
+            elif msg[1] > 50: # Turn counter-clockwise
+                self.stateData.iterate_selection(-1)
+
+    async def process_fader(self, msg):
+        if self.state != self.State.Active:
+            return
+
+        self.stateData.faderTime = time.time_ns()
+
+        db = utils.x32_fader_val_to_db(msg[1])
+        req = simpleobsws.Request('SetInputVolume', {'inputUuid': self.stateData.input.uuid, 'inputVolumeDb': db})
+        await self.midi.obs.ws.emit(req)
+
+    def on_input_volmeter(self, data):
+        if self.state != self.State.Active:
+            return
+
+        average_mul = [channel[1] for channel in data]
+        average_mul = sum(average_mul) / len(average_mul)
+
+        if average_mul > 0:
+            current_peak_db = 20 * math.log10(average_mul)
+
+            if current_peak_db < -60:
+                current_peak_db = -60
+            elif current_peak_db > -4:
+                current_peak_db = 0
+
+            self.midi._set_volmeter_db(self.num, current_peak_db)
+
+    def on_input_balance_change(self, data):
+        if self.state != self.State.Active:
+            return
+
+        self.stateData.input.audioBalance = data['inputAudioBalance']
+        self.stateData._render_leds()
+
+    def on_input_track_change(self, data):
+        if self.state != self.State.Active:
+            return
+
+        self.stateData.input.audioTracks = data['inputAudioTracks']
+        self.stateData._render_leds()
+
+    def on_input_monitor_change(self, data):
+        if self.state != self.State.Active:
+            return
+
+        self.stateData.input.audioMonitorType = data['monitorType']
+        self.stateData._render_leds()
+
+    def on_input_mute_change(self, data):
+        if self.state != self.State.Active:
+            return
+
+        self.stateData.input.audioMuted = data['inputMuted']
+        self.stateData._render_leds()
+
+    def on_input_volume_change(self, data):
+        if self.state != self.State.Active:
+            return
+
+        self.stateData.input.audioVolumeDb = data['inputVolumeDb']
+        self.stateData._render_fader()
