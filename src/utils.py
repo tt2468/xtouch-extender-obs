@@ -1,5 +1,6 @@
 import logging
-import rtmidi
+import json
+from dataclasses import dataclass, field
 
 X32_FADER_SCALE = 0.90 # x32 faders don't quite register the limits of their physical travel.
 X32_FADER_RANGE = 127.0
@@ -29,3 +30,51 @@ def x32_db_to_fader_val(db: float) -> int:
     val = (val * (X32_FADER_RANGE / 16)) + (X32_FADER_RANGE * 0.75)
     deflection = ((val - X32_FADER_RANGE_HALF) / X32_FADER_SCALE) + X32_FADER_RANGE_HALF
     return int(deflection) if deflection > 0.0 else 0
+
+@dataclass
+class StripConfig:
+    obsInputUuid: str = ''
+    lcdColorIdx: int = 7
+
+    def to_dict(self):
+        return {
+            'obs_input_uuid': self.obsInputUuid,
+            'lcd_color_idx': self.lcdColorIdx
+        }
+
+    @staticmethod
+    def from_dict(data):
+        ret = StripConfig()
+        ret.obsInputUuid = data.get('obs_input_uuid') or ret.obsInputUuid
+        ret.lcdColorIdx = data.get('lcd_color_idx') or ret.lcdColorIdx
+        return ret
+
+@dataclass
+class Config:
+    strips: list[StripConfig] = field(default_factory = list)
+
+    def load(self, fileName: str) -> bool:
+        try:
+            with open(fileName, 'r') as f:
+                config = json.load(f)
+
+                strips = config.get('strips')
+                if type(strips) == list:
+                    for strip in strips:
+                        self.strips.append(StripConfig.from_dict(strip) if type(strip) == dict else StripConfig())
+        except:
+            logging.exception('Exception loading config file `{}`:\n'.format(fileName))
+            return False
+        return True
+
+    def save(self, fileName: str) -> bool:
+        try:
+            data = {
+                'strips': [strip.to_dict() for strip in self.strips]
+            }
+            with open(fileName, 'w') as f:
+                json.dump(data, f, indent = 2)
+        except:
+            logging.exception('Exception writing config file `{}`:\n'.format(fileName))
+            return False
+        return True

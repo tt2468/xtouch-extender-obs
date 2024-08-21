@@ -46,8 +46,9 @@ class ObsStudio:
         parameters = simpleobsws.IdentificationParameters()
         parameters.eventSubscriptions = (1 << 3) | (1 << 16)
         self.ws = simpleobsws.WebSocketClient(url = websocketUrl, password = websocketPassword, identification_parameters=parameters)
-        self.ws.register_event_callback(self._event_on_input_created, "InputCreated")
-        self.ws.register_event_callback(self._event_on_input_removed, "InputRemoved")
+        self.ws.register_event_callback(self._event_on_input_created, 'InputCreated')
+        self.ws.register_event_callback(self._event_on_input_removed, 'InputRemoved')
+        self.ws.register_event_callback(self._event_on_input_name_changed, 'InputNameChanged')
 
         self.inputsLock = asyncio.Lock()
         self.inputs = {}
@@ -80,13 +81,14 @@ class ObsStudio:
                 input = Input.from_obsws_data(inputData)
                 await input.hydrate(self.ws)
                 self.inputs[input.uuid] = input
-                self.inputNames.insert(bisect.bisect_left([x[0] for x in self.inputNames], input.name), [input.name, input])
+                self.inputNames.insert(bisect.bisect_left([x[0].lower() for x in self.inputNames], input.name.lower()), [input.name, input])
 
     async def _event_on_input_created(self, eventData):
         input = Input.from_obsws_data(eventData)
         async with self.inputsLock:
+            await input.hydrate(self.ws)
             self.inputs[input.uuid] = input
-            self.inputNames.insert(bisect.bisect_left([x[0] for x in self.inputNames], input.name), [input.name, input])
+            self.inputNames.insert(bisect.bisect_left([x[0].lower() for x in self.inputNames], input.name.lower()), [input.name, input])
 
     async def _event_on_input_removed(self, eventData):
         inputUuid = eventData['inputUuid']
@@ -94,7 +96,15 @@ class ObsStudio:
             if inputUuid not in self.inputs:
                 return
             del self.inputs[inputUuid]
-            self.inputNames = [x for x in self.inputNames if x.uuid != inputUuid]
+            self.inputNames = [x for x in self.inputNames if x[1].uuid != inputUuid]
 
-    async def _event_on_input_renamed(self, eventData):
-        pass # TODO
+    async def _event_on_input_name_changed(self, eventData):
+        inputUuid = eventData['inputUuid']
+        async with self.inputsLock:
+            if inputUuid not in self.inputs:
+                return
+            # This whole process is really inefficient
+            self.inputNames = [x for x in self.inputNames if x[1].uuid != inputUuid]
+            input = self.inputs[inputUuid]
+            input.name = eventData['inputName']
+            self.inputNames.insert(bisect.bisect_left([x[0].lower() for x in self.inputNames], input.name.lower()), [input.name, input])

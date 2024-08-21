@@ -84,19 +84,33 @@ class Device:
             return ret == 2
         return await asyncio.to_thread(do_open, self)
 
-    def set_obs(self, obs):
+    def set_obs(self, obs: obs.ObsStudio):
         self.obs = obs
 
-    async def create_strips(self, num):
+    async def create_strips(self, num: int):
         async with self.lock:
             self.strips = []
             for i in range(num):
                 strip = await asyncio.to_thread(Strip, self, len(self.strips))
-                await asyncio.to_thread(strip.reset)
                 self.strips.append(strip)
+
+    async def load_strips(self, config: utils.Config):
+        async with self.lock:
+            for i, strip in enumerate(self.strips):
+                if len(config.strips) <= i:
+                    break
+                await strip.load_config(config.strips[i])
+
+    async def persist_strips(self, config: utils.Config):
+        async with self.lock:
+            config.strips = []
+            for strip in self.strips:
+                config.strips.append(strip.get_config())
 
     async def clear_strips(self):
         async with self.lock:
+            for strip in self.strips:
+                await asyncio.to_thread(strip.reset) # Sets the panel state back to default
             self.strips = []
 
     def _set_lcd_color(self, num: int, colorIdx: int):
@@ -185,7 +199,6 @@ class Strip:
             self.num = num
 
             self.input = None
-
             self.lcdColorIdx = 7
 
             self.faderTime = None
@@ -302,6 +315,30 @@ class Strip:
         self.enc_mode = 3
         self.enc_value = -81
 
+        self.stateData.render()
+
+    def get_config(self) -> utils.StripConfig:
+        if self.state == self.State.Idle:
+            return utils.StripConfig()
+        if self.state == self.State.Active:
+            return utils.StripConfig(obsInputUuid = self.stateData.input.uuid, lcdColorIdx = self.stateData.lcdColorIdx)
+        if self.state == self.State.Config:
+            if self.oldState == self.State.Active:
+                return utils.StripConfig(obsInputUuid = self.oldStateData.input.uuid, lcdColorIdx = self.stateData.lcdColorIdx)
+        return utils.StripConfig()
+
+    async def load_config(self, config: utils.StripConfig):
+        if self.state != self.State.Idle:
+            await asyncio.to_thread(self.reset)
+        if config.obsInputUuid and config.obsInputUuid in self.midi.obs.inputs:
+            self.state = self.State.Active
+            self.stateData = self.StateDataActive(self.midi, self.num)
+            self.stateData.input = self.midi.obs.inputs[config.obsInputUuid]
+            self.stateData.lcdColorIdx = config.lcdColorIdx
+            self.midi.stripInputUuids[self.stateData.input.uuid] = self
+            await asyncio.to_thread(self.stateData.render)
+            logging.debug('Loaded input on strip {} - Name: {} | UUID: {}'.format(self.num, self.stateData.input.name, self.stateData.input.uuid))
+
     def reset(self):
         # reset internal variables
         if self.state == self.State.Active:
@@ -310,6 +347,8 @@ class Strip:
         self.state = self.State.Idle
         self.stateData = self.StateDataIdle(self.midi, self.num)
         self.oldState = None
+        if self.oldStateData:
+            self.oldStateData.midi = None
         self.oldStateData = None
         self.enc_mode = 3
         self.enc_value = -81
@@ -460,49 +499,55 @@ class Strip:
             return
 
         average_mul = [channel[1] for channel in data]
-        average_mul = sum(average_mul) / len(average_mul)
+        average_mul = (sum(average_mul) / len(average_mul)) if average_mul else 0.0
 
-        if average_mul > 0:
+        if average_mul > 0.0:
             current_peak_db = 20 * math.log10(average_mul)
 
-            if current_peak_db < -60:
-                current_peak_db = -60
-            elif current_peak_db > -4:
-                current_peak_db = 0
+            if current_peak_db < -60.0:
+                current_peak_db = -60.0
+            elif current_peak_db > -4.0:
+                current_peak_db = 0.0
 
             self.midi._set_volmeter_db(self.num, current_peak_db)
 
-    def on_input_balance_change(self, data):
+    async def on_input_balance_change(self, data):
         if self.state != self.State.Active:
             return
 
         self.stateData.input.audioBalance = data['inputAudioBalance']
-        self.stateData._render_leds()
+        await asyncio.to_thread(self.stateData._render_leds)
 
-    def on_input_track_change(self, data):
+    async def on_input_track_change(self, data):
         if self.state != self.State.Active:
             return
 
         self.stateData.input.audioTracks = data['inputAudioTracks']
-        self.stateData._render_leds()
+        await asyncio.to_thread(self.stateData._render_leds)
 
-    def on_input_monitor_change(self, data):
+    async def on_input_monitor_change(self, data):
         if self.state != self.State.Active:
             return
 
         self.stateData.input.audioMonitorType = data['monitorType']
-        self.stateData._render_leds()
+        await asyncio.to_thread(self.stateData._render_leds)
 
-    def on_input_mute_change(self, data):
+    async def on_input_mute_change(self, data):
         if self.state != self.State.Active:
             return
 
         self.stateData.input.audioMuted = data['inputMuted']
-        self.stateData._render_leds()
+        await asyncio.to_thread(self.stateData._render_leds)
 
-    def on_input_volume_change(self, data):
+    async def on_input_volume_change(self, data):
         if self.state != self.State.Active:
             return
 
         self.stateData.input.audioVolumeDb = data['inputVolumeDb']
-        self.stateData._render_fader()
+        await asyncio.to_thread(self.stateData._render_fader)
+
+    async def on_input_name_change(self):
+        if self.state != self.State.Active:
+            return
+
+        await asyncio.to_thread(self.stateData._render_lcd)

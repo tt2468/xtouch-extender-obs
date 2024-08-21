@@ -8,6 +8,9 @@ import midi as midi_lib
 import utils
 
 logging.basicConfig(level = logging.DEBUG)
+logging.getLogger('simpleobsws').setLevel(logging.INFO)
+
+CONFIG_FILE_NAME = 'xtouch-obs-config.json'
 
 OBS_WEBSOCKET_URL = 'ws://localhost:4455'
 OBS_WEBSOCKET_PASSWORD = ''
@@ -17,51 +20,67 @@ MIDI_DEVICE_SIGNATURE = 'X-Touch-Ext'
 MIDI_DEVICE_INDEX = 0
 MIDI_STRIP_COUNT = 8
 
+config = None
 obs = None
 midi = None
 
-async def obs_volmeter_callback(event_data):
-    for input in event_data["inputs"]:
+async def obs_volmeter_callback(eventData):
+    for input in eventData["inputs"]:
         uuid = input['inputUuid']
         strip = midi.stripInputUuids.get(uuid)
         if not strip:
             continue
         strip.on_input_volmeter(input['inputLevelsMul'])
 
-async def obs_balance_callback(event_data):
-    uuid = event_data['inputUuid']
+async def obs_balance_callback(eventData):
+    uuid = eventData['inputUuid']
     strip = midi.stripInputUuids.get(uuid)
     if not strip:
         return
-    strip.on_input_balance_change(event_data)
+    await strip.on_input_balance_change(eventData)
 
-async def obs_track_callback(event_data):
-    uuid = event_data['inputUuid']
+async def obs_track_callback(eventData):
+    uuid = eventData['inputUuid']
     strip = midi.stripInputUuids.get(uuid)
     if not strip:
         return
-    strip.on_input_track_change(event_data)
+    await strip.on_input_track_change(eventData)
 
-async def obs_monitor_callback(event_data):
-    uuid = event_data['inputUuid']
+async def obs_monitor_callback(eventData):
+    uuid = eventData['inputUuid']
     strip = midi.stripInputUuids.get(uuid)
     if not strip:
         return
-    strip.on_input_monitor_change(event_data)
+    await strip.on_input_monitor_change(eventData)
 
-async def obs_mute_callback(event_data):
-    uuid = event_data['inputUuid']
+async def obs_mute_callback(eventData):
+    uuid = eventData['inputUuid']
     strip = midi.stripInputUuids.get(uuid)
     if not strip:
         return
-    strip.on_input_mute_change(event_data)
+    await strip.on_input_mute_change(eventData)
 
-async def obs_volume_callback(event_data):
-    uuid = event_data['inputUuid']
+async def obs_volume_callback(eventData):
+    uuid = eventData['inputUuid']
     strip = midi.stripInputUuids.get(uuid)
     if not strip:
         return
-    strip.on_input_volume_change(event_data)
+    await strip.on_input_volume_change(eventData)
+
+async def obs_input_name_changed_callback(eventData):
+    uuid = eventData['inputUuid']
+    strip = midi.stripInputUuids.get(uuid)
+    if not strip:
+        return
+    # Prior callbacks would have updated the input name in the object already
+    await strip.on_input_name_change()
+
+async def obs_input_remove_callback(eventData):
+    uuid = eventData['inputUuid']
+    strip = midi.stripInputUuids.get(uuid)
+    if not strip:
+        return
+    await asyncio.to_thread(strip.reset)
 
 def on_midi_message(msg, loop):
     if not msg:
@@ -97,9 +116,14 @@ def on_midi_message(msg, loop):
                     logging.exception('Exception:\n')
             asyncio.run_coroutine_threadsafe(process([b1, b3]), loop)
     except:
-        logging.exception('Exception:\n')
+        logging.exception('Exception when handling incoming MIDI message:\n')
 
 async def main():
+    global config
+    config = utils.Config()
+    if not config.load(CONFIG_FILE_NAME):
+        logging.warning('Config file `{}` not loaded. Using default config.')
+
     global midi
     midi = midi_lib.Device(MIDI_DEVICE_SIGNATURE, MIDI_DEVICE_INDEX)
     await midi.print_ports()
@@ -125,8 +149,16 @@ async def main():
     obs.ws.register_event_callback(obs_monitor_callback, "InputAudioMonitorTypeChanged")
     obs.ws.register_event_callback(obs_mute_callback, "InputMuteStateChanged")
     obs.ws.register_event_callback(obs_volume_callback, "InputVolumeChanged")
+    obs.ws.register_event_callback(obs_input_name_changed_callback, "InputNameChanged")
+    obs.ws.register_event_callback(obs_input_remove_callback, "InputRemoved")
 
     await midi.create_strips(MIDI_STRIP_COUNT)
+    await midi.load_strips(config)
+    if len(midi.strips) != len(config.strips):
+        oldConfigStrips = len(config.strips)
+        await midi.persist_strips(config)
+        config.save(CONFIG_FILE_NAME)
+        logging.info('Updated config file from {} to {} strips.'.format(oldConfigStrips, len(config.strips)))
     midi.input.set_callback(on_midi_message, asyncio.get_running_loop())
 
     logging.info('Finished starting up.')
@@ -141,11 +173,22 @@ async def main():
             await asyncio.sleep(0.05)
     except asyncio.exceptions.CancelledError:
         logging.info('Shutting down...')
+    try:
+        await midi.persist_strips(config)
+        if config.save(CONFIG_FILE_NAME):
+            logging.info('Config file `{}` saved.'.format(CONFIG_FILE_NAME))
+        else:
+            logging.info('Failed to save config file: {}'.format(CONFIG_FILE_NAME))
 
-    await obs.shutdown()
-    await midi.clear_strips()
+        await obs.shutdown()
+        await midi.clear_strips()
+
+        logging.info('Finished shutting down.')
+    except:
+        logging.exception('Exception:\n')
 
 def process_args():
+    global CONFIG_FILE_NAME
     global OBS_WEBSOCKET_URL
     global OBS_WEBSOCKET_PASSWORD
     global MIDI_DEVICE_SIGNATURE
@@ -153,6 +196,7 @@ def process_args():
     global MIDI_STRIP_COUNT
 
     parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config_file', type = str, default = CONFIG_FILE_NAME, help = 'Config/state file name, used for persistence of configurations made via the X-Touch device. Default: {}'.format(CONFIG_FILE_NAME))
     parser.add_argument('-u', '--websocket_url', type = str, default = OBS_WEBSOCKET_URL, help = 'obs-websocket URL. Default: {}'.format(OBS_WEBSOCKET_URL))
     parser.add_argument('-p', '--websocket_password', type = str, default = '', help = 'obs-websocket Password. Default is none.')
     parser.add_argument('-s', '--midi_signature', type = str, default = MIDI_DEVICE_SIGNATURE, help = 'MIDI device signature - a string to look for in the device name. Default: {}'.format(MIDI_DEVICE_SIGNATURE))
@@ -160,6 +204,7 @@ def process_args():
     parser.add_argument('-S', '--midi_strip_count', type = int, default = MIDI_STRIP_COUNT, help = 'Number of strips that the device has. Default: {}'.format(MIDI_STRIP_COUNT))
 
     args = parser.parse_args()
+    CONFIG_FILE_NAME = args.config_file
     OBS_WEBSOCKET_URL = args.websocket_url
     OBS_WEBSOCKET_PASSWORD = args.websocket_password
     MIDI_DEVICE_SIGNATURE = args.midi_signature
