@@ -10,7 +10,6 @@ from enum import Enum
 import obs
 import utils
 
-MIDI_SIGNATURE = 'X-Touch-Ext'
 MIDI_SCREEN_COLORS = {
     1: "RED",
     2: "GREEN",
@@ -32,8 +31,10 @@ def my_map(x, in_min, in_max, out_min, out_max):
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
 class Device:
-    def __init__(self):
+    def __init__(self, deviceSignature: str, deviceIndex: int = 0):
         self.obs = None
+        self.deviceSignature = deviceSignature
+        self.deviceIndex = deviceIndex
 
         self.input = rtmidi.MidiIn()
         self.output = rtmidi.MidiOut()
@@ -54,8 +55,12 @@ class Device:
     async def open_ports(self):
         def do_open(self):
             ret = 0
+            foundIndex = 0
             for i, port in enumerate(self.input.get_ports()):
-                if MIDI_SIGNATURE in port:
+                if self.deviceSignature in port:
+                    if self.deviceIndex != foundIndex:
+                        foundIndex += 1
+                        continue
                     self.input.open_port(i)
                     if not self.input.is_port_open():
                         logging.error('Failed to open port {} at idx: {}'.format(self.input.get_port_name(i), i))
@@ -63,8 +68,12 @@ class Device:
                     ret += 1
                     logging.info('Opened IN port at idx {}: {}'.format(i, self.input.get_port_name(i)))
                     break
+            foundIndex = 0
             for i, port in enumerate(self.output.get_ports()):
-                if MIDI_SIGNATURE in port:
+                if self.deviceSignature in port:
+                    if self.deviceIndex != foundIndex:
+                        foundIndex += 1
+                        continue
                     self.output.open_port(i)
                     if not self.output.is_port_open():
                         logging.error('Failed to open port {} at idx: {}'.format(self.output.get_port_name(i), i))
@@ -157,9 +166,9 @@ class Strip:
             self.lcdColorIdx = 7
 
         def render(self):
-            logging.info('Idle render')
             if not self.midi:
                 return
+            logging.debug('Rendering State: Idle')
             self.midi._set_lcd_color(self.num, self.lcdColorIdx)
             self.midi._write_text(self.num, 0, '')
             self.midi._write_text(self.num, 1, '')
@@ -182,9 +191,9 @@ class Strip:
             self.faderTime = None
 
         def render(self):
-            logging.info('Active render')
             if not self.midi:
                 return
+            logging.debug('Rendering State: Active')
             self._render_leds()
             self._render_lcd()
             self._render_fader()
@@ -240,9 +249,9 @@ class Strip:
             self.lcdColorIdx = 7
 
         def render(self):
-            logging.info('Config render')
             if not self.midi:
                 return
+            logging.debug('Rendering State: Config')
             self._render_leds()
             self._render_lcd()
 

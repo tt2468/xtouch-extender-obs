@@ -1,17 +1,20 @@
 import logging
 import time
 import asyncio
+import argparse
 
 import obs as obs_lib
 import midi as midi_lib
 import utils
 
-logging.basicConfig(level = logging.INFO)
+logging.basicConfig(level = logging.DEBUG)
 
-OBS_WEBSOCKET_URL = 'ws://127.0.0.1:4455'
-OBS_WEBSOCKET_PASSWORD = 'testing'
+OBS_WEBSOCKET_URL = 'ws://localhost:4455'
+OBS_WEBSOCKET_PASSWORD = ''
 
 FADER_TIMEOUT = 0.3
+MIDI_DEVICE_SIGNATURE = 'X-Touch-Ext'
+MIDI_DEVICE_INDEX = 0
 MIDI_STRIP_COUNT = 8
 
 obs = None
@@ -98,7 +101,7 @@ def on_midi_message(msg, loop):
 
 async def main():
     global midi
-    midi = midi_lib.Device()
+    midi = midi_lib.Device(MIDI_DEVICE_SIGNATURE, MIDI_DEVICE_INDEX)
     await midi.print_ports()
     if not await midi.open_ports():
         logging.critical('Failed to open MIDI ports!')
@@ -114,6 +117,7 @@ async def main():
         logging.exception('Failed to connect or identify with OBS:\n')
         return
     midi.set_obs(obs)
+    logging.info('Connected and identified with obs-websocket at URL: {}'.format(OBS_WEBSOCKET_URL))
 
     obs.ws.register_event_callback(obs_volmeter_callback, "InputVolumeMeters")
     obs.ws.register_event_callback(obs_balance_callback, "InputAudioBalanceChanged")
@@ -125,16 +129,44 @@ async def main():
     await midi.create_strips(MIDI_STRIP_COUNT)
     midi.input.set_callback(on_midi_message, asyncio.get_running_loop())
 
-    while True:
-        for strip in midi.strips:
-            if strip.state != strip.State.Active:
-                continue
-            if strip.stateData.fader_busy() == -1:
-                await asyncio.to_thread(strip.stateData._render_fader)
-        await asyncio.sleep(0.05)
+    logging.info('Finished starting up.')
+
+    try:
+        while True:
+            for strip in midi.strips:
+                if strip.state != strip.State.Active:
+                    continue
+                if strip.stateData.fader_busy() == -1:
+                    await asyncio.to_thread(strip.stateData._render_fader)
+            await asyncio.sleep(0.05)
+    except asyncio.exceptions.CancelledError:
+        logging.info('Shutting down...')
 
     await obs.shutdown()
     await midi.clear_strips()
 
+def process_args():
+    global OBS_WEBSOCKET_URL
+    global OBS_WEBSOCKET_PASSWORD
+    global MIDI_DEVICE_SIGNATURE
+    global MIDI_DEVICE_INDEX
+    global MIDI_STRIP_COUNT
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-u', '--websocket_url', type = str, default = OBS_WEBSOCKET_URL, help = 'obs-websocket URL. Default: {}'.format(OBS_WEBSOCKET_URL))
+    parser.add_argument('-p', '--websocket_password', type = str, default = '', help = 'obs-websocket Password. Default is none.')
+    parser.add_argument('-s', '--midi_signature', type = str, default = MIDI_DEVICE_SIGNATURE, help = 'MIDI device signature - a string to look for in the device name. Default: {}'.format(MIDI_DEVICE_SIGNATURE))
+    parser.add_argument('-d', '--midi_device', type = int, default = 0, help = 'MIDI device index to select out of the devices matching the signature. Default: 0')
+    parser.add_argument('-S', '--midi_strip_count', type = int, default = MIDI_STRIP_COUNT, help = 'Number of strips that the device has. Default: {}'.format(MIDI_STRIP_COUNT))
+
+    args = parser.parse_args()
+    OBS_WEBSOCKET_URL = args.websocket_url
+    OBS_WEBSOCKET_PASSWORD = args.websocket_password
+    MIDI_DEVICE_SIGNATURE = args.midi_signature
+    MIDI_DEVICE_INDEX = args.midi_device
+    MIDI_STRIP_COUNT = args.midi_strip_count
+
 # todo implement RTP-MIDI (ethernet) protocol
-asyncio.run(main())
+if __name__ == "__main__":
+    process_args()
+    asyncio.run(main())
