@@ -13,5 +13,5 @@ jobs:
           python_ver: '3.12'
           spec: 'src/main.py'
           requirements: 'requirements.txt'
-          upload_exe_with_name: 'xtouch-extender-obs'
+          upload_exe_with_name: 'xtouch-extender-obs.exe'
           options: --onefile, --name "X-TOUCH EXTENDER OBS", --windowed, 
