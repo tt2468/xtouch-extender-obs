@@ -1,5 +1,6 @@
 import logging
 import time
+import platform
 import asyncio
 import argparse
 
@@ -215,3 +216,5 @@ def process_args():
 if __name__ == "__main__":
     process_args()
     asyncio.run(main())
+    if platform.system() == 'Windows':
+        input('Press any key to exit...')
