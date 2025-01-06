@@ -8,7 +8,7 @@ import obs as obs_lib
 import midi as midi_lib
 import utils
 
-logging.basicConfig(level = logging.DEBUG)
+logging.basicConfig(level = logging.DEBUG, filename = 'xtouch-extender-obs.log')
 logging.getLogger('simpleobsws').setLevel(logging.INFO)
 
 CONFIG_FILE_NAME = 'xtouch-obs-config.json'
@@ -216,5 +216,3 @@ def process_args():
 if __name__ == "__main__":
     process_args()
     asyncio.run(main())
-    if platform.system() == 'Windows':
-        input('Press any key to exit...')
